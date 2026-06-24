@@ -1,0 +1,11 @@
+# Small experiment: GPT-2 (124M), 2 GPUs, 512 seq_len
+# Run: NUM_GPUS=2 STRATEGY=ddp DTYPE=bf16 ./launch.sh --config configs/small.yaml
+
+model:      gpt2
+strategy:   ddp
+dtype:      bf16
+batch_size: 8
+seq_len:    512
+steps:      200
+grad_accum: 2
+lr:         3.0e-4
