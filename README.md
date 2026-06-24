@@ -18,7 +18,7 @@ A focused benchmark of distributed LLM training strategies using PyTorch — bui
 ## Benchmark Results
 
 Ran on **2× NVIDIA A100 SXM4 80GB** (NVLink interconnect) on Vast.ai. Throughput compared at step 50 across all runs for apples-to-apples comparison.  
-Model: `gpt2` (~117M params) | Sequence length: 512 | Batch size: 4 | Steps: 100
+Model: `gpt2` (~117M params) | Sequence length: 512 | Batch size: 4 | Steps: 50
 
 | Strategy | Dtype | GPUs | Tokens/sec | Peak Mem/GPU | Final Loss |
 |----------|-------|------|-----------|--------------|------------|
