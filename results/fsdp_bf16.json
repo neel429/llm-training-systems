@@ -1,0 +1,14 @@
+{
+  "strategy": "fsdp",
+  "dtype": "bf16",
+  "model": "gpt2",
+  "world_size": 2,
+  "batch_size": 4,
+  "seq_len": 512,
+  "steps": 100,
+  "grad_accum": 1,
+  "tokens_per_sec": 43921.5,
+  "peak_mem_gb": 3.452,
+  "final_loss": 3.3371,
+  "elapsed_sec": 9.3
+}
