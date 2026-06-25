@@ -137,25 +137,17 @@ def get_block_class(model: nn.Module, model_name: str) -> type:
 def build_model(args: argparse.Namespace) -> nn.Module:
     """
     Load the base model in FP32, then optionally apply FP8 conversion.
-
-    FP8 conversion (torchao) must happen before FSDP wrapping because torchao
-    replaces nn.Linear modules in-place — FSDP would otherwise hide them behind
-    flat-param views where they can't be found.
     """
     model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float32)
 
     if args.dtype == "fp8":
         try:
             from torchao.float8 import convert_to_float8_training
-        except ImportError:
-            raise ImportError(
-                "FP8 training requires torchao >= 0.3.0. "
-                "Install: pip install torchao"
-            )
+        except ImportError as e:
+            print(f"FP8 import failed: {e}")
+            raise
         model = model.cuda()
-        # convert_to_float8_training replaces each eligible nn.Linear with
-        # Float8Linear, which stores weights and activations in E4M3/E5M2 FP8
-        # and accumulates in BF16 — cutting memory bandwidth ~2× vs BF16.
+        
         convert_to_float8_training(model)
     else:
         model = model.cuda()
