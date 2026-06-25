@@ -101,7 +101,7 @@ def get_block_class(model: nn.Module, model_name: str) -> type:
     """
     Identify the transformer block class for FSDP's ModuleWrapPolicy.
 
-    We first look up the known map; if the model type isn't listed we fall back
+    I first look up the known map; if the model type isn't listed I fall back
     to finding the most frequently repeated non-primitive module class, which is
     almost always the transformer block (repeated once per layer).
     """
@@ -158,8 +158,6 @@ def build_model(args: argparse.Namespace) -> nn.Module:
 def wrap_model(model: nn.Module, args: argparse.Namespace, local_rank: int) -> nn.Module:
     """Apply DDP or FSDP parallelism to the model."""
     if args.strategy == "ddp":
-        # find_unused_parameters=False avoids the parameter-usage-detection pass —
-        # all parameters always participate in the causal LM loss, so it's safe.
         return DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
     # ---- FSDP (ZeRO-3 style) ----
@@ -192,10 +190,6 @@ def wrap_model(model: nn.Module, args: argparse.Namespace, local_rank: int) -> n
 def make_autocast_ctx(args: argparse.Namespace):
     """
     Return the autocast context for the forward pass.
-
-    FSDP manages its own mixed-precision via MixedPrecision config, so autocast
-    would be redundant. FP8 is handled at the layer level by Float8Linear.
-    Only DDP + BF16/FP16 needs torch.amp.autocast.
     """
     if args.strategy == "ddp":
         if args.dtype == "bf16":
@@ -214,9 +208,8 @@ class TokenStream:
     Streams wikitext-103-v1 from HuggingFace datasets, tokenises on the fly,
     and yields fixed-length token chunks for causal LM training.
 
-    Streaming avoids downloading the ~500 MB corpus — only tokens we actually
-    consume touch the network. Each rank processes a disjoint shard (modulo
-    sharding) so GPUs don't duplicate work.
+    Yes, Streaming adds network latency per batch, but at my scale the GPU 
+    compute time dominates so it doesn't matter.
     """
 
     def __init__(self, model_name: str, seq_len: int, rank: int, world_size: int):
@@ -230,7 +223,7 @@ class TokenStream:
         self._gen = self._make_gen()
 
     def _make_gen(self):
-        ds = load_dataset("wikitext", "wikitext-103-v1", split="train", streaming=True)
+        ds = load_dataset("Salesforce/wikitext", "wikitext-103-v1", split="train", streaming=True)
         buf: list[int] = []
         for idx, ex in enumerate(ds):
             if idx % self.world_size != self.rank:
