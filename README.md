@@ -148,3 +148,6 @@ This project was built with the assistance of AI at various stages — code gene
 The benchmarks were run on a real rented GPU (2× A100 SXM4 80GB on Vast.ai), not simulated or fabricated. The numbers were then cross-checked for correctness — for example, an initially reported 2.48× scaling figure was identified as a measurement artifact (different step counts between runs) and corrected to the honest 1.70× step-matched comparison.
 
 The goal was to actually understand and practice using a distributed training infrastructure.
+
+## Work in progress:
+I am trying to now build my own AllReduce and AllGather/ReduceScatter, and will try to compare it against the pytorch's torch.distributed
