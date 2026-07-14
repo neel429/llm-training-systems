@@ -23,6 +23,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import yaml
+from ring_all_reduce import ring_all_reduce
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -62,6 +63,8 @@ def parse_args() -> argparse.Namespace:
                    help="Gradient accumulation steps. Effective BS = batch_size × grad_accum × world_size")
     p.add_argument("--lr",          type=float, default=3e-4)
     p.add_argument("--output_dir",  default="results")
+    p.add_argument("--use_custom_allreduce", action="store_true",
+                   help="Replace DDP's built-in all-reduce with the custom ring all-reduce (DDP only)")
     return p.parse_args()
 
 
@@ -293,6 +296,13 @@ def train(args: argparse.Namespace) -> None:
 
     autocast_ctx = make_autocast_ctx(args)
 
+    # Custom ring all-reduce is only meaningful for DDP with >1 GPU.
+    use_custom_reduce = (
+        args.use_custom_allreduce
+        and args.strategy == "ddp"
+        and world_size > 1
+    )
+
     torch.cuda.reset_peak_memory_stats(local_rank)
     total_tokens = 0
     total_loss   = 0.0
@@ -308,8 +318,13 @@ def train(args: argparse.Namespace) -> None:
             # Suppress gradient synchronisation on all but the last micro-step.
             # For DDP this skips the all-reduce; for FSDP it skips reduce-scatter.
             # This reduces inter-GPU traffic by (grad_accum-1)/grad_accum.
+            # When using the custom ring all-reduce, suppress DDP's built-in
+            # all-reduce on every step — we will drive it manually below.
             is_last = accum_idx == args.grad_accum - 1
-            sync_ctx = nullcontext() if is_last else model.no_sync()
+            if use_custom_reduce:
+                sync_ctx = model.no_sync()
+            else:
+                sync_ctx = nullcontext() if is_last else model.no_sync()
 
             with sync_ctx, autocast_ctx:
                 out  = model(input_ids=input_ids, labels=input_ids)
@@ -322,10 +337,22 @@ def train(args: argparse.Namespace) -> None:
 
             step_loss += loss.item()
 
+        # Manual gradient synchronisation via custom ring all-reduce.
+        # Mirrors DDP semantics: SUM across ranks then divide by world_size.
+        if use_custom_reduce:
+            if scaler is not None:
+                scaler.unscale_(optimizer)  # de-scale before touching raw grads
+            for param in model.module.parameters():
+                if param.grad is not None:
+                    ring_all_reduce(param.grad, rank, world_size)
+                    param.grad.div_(world_size)
+
         # Gradient clipping. FSDP.clip_grad_norm_ computes the global norm
         # across shards correctly; torch.nn.utils version only sees local shard.
+        already_unscaled = use_custom_reduce and scaler is not None
         if scaler is not None:
-            scaler.unscale_(optimizer)
+            if not already_unscaled:
+                scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
