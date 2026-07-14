@@ -10,6 +10,7 @@ A focused benchmark of distributed LLM training strategies using PyTorch — bui
 
 - **DDP** (DistributedDataParallel) — data-parallel training with NCCL AllReduce gradient sync across GPUs
 - **FSDP** (FullyShardedDataParallel) — ZeRO-3 style sharding of model weights, gradients, and optimizer states across GPUs
+- **Ring AllReduce from scratch** — custom two-phase (reduce-scatter + allgather) implementation over raw `dist.send/recv`, wired into the DDP training loop as a drop-in replacement for NCCL's built-in `dist.all_reduce`
 - **BF16 mixed precision** — automatic mixed precision via `torch.amp` for memory-efficient training
 - **Throughput & memory benchmarking** — tokens/sec, peak GPU memory, and loss tracked per run and saved to JSON
 
@@ -58,6 +59,25 @@ Model: `gpt2` (~117M params) | Sequence length: 512 | Batch size: 4 | Steps: 50
      Identical weight update
 ```
 
+### Ring AllReduce — custom reduce-scatter + allgather over raw send/recv
+```
+Phase 1: Reduce-Scatter (world_size-1 steps)
+  Each rank sends its chunk to its right neighbour and accumulates the chunk
+  arriving from its left neighbour. After N-1 steps every rank holds one
+  fully-summed chunk.
+
+  rank 0 ──[chunk 0]──► rank 1 ──[chunk 1]──► rank 2 ──[chunk 2]──► rank 0
+         ◄──[chunk 2]──        ◄──[chunk 0]──        ◄──[chunk 1]──
+
+Phase 2: AllGather (world_size-1 steps)
+  Each rank relays its finished chunk around the ring until every rank has
+  all chunks. Chunks are overwritten in-place (no accumulation needed).
+
+  rank 0 ──[sum 0]──► rank 1 ──[sum 1]──► rank 2 ──[sum 2]──► rank 0
+
+Result: identical to dist.all_reduce(..., op=SUM) ÷ world_size
+```
+
 ### FSDP — Fully Sharded (model split across GPUs)
 ```
 ┌─────────────────────────────────────────────┐
@@ -102,6 +122,11 @@ torchrun --nproc_per_node=1 train.py --strategy ddp --dtype bf16 --steps 50
 torchrun --nproc_per_node=2 train.py --strategy ddp --dtype bf16 --steps 100
 ```
 
+### Multi-GPU DDP with custom ring all-reduce
+```bash
+torchrun --nproc_per_node=2 train.py --strategy ddp --dtype bf16 --steps 100 --use_custom_allreduce
+```
+
 ### Multi-GPU FSDP
 ```bash
 torchrun --nproc_per_node=2 train.py --strategy fsdp --dtype bf16 --steps 100
@@ -115,13 +140,14 @@ python benchmark.py
 
 ### All flags
 ```
---strategy   ddp | fsdp
---dtype      bf16 | fp16
---model      any HuggingFace causal LM (default: gpt2)
---steps      number of training steps (default: 100)
---batch_size per-GPU batch size (default: 4)
---seq_len    sequence length (default: 512)
---grad_accum gradient accumulation steps (default: 1)
+--strategy             ddp | fsdp
+--dtype                bf16 | fp16 | fp32 | fp8
+--model                any HuggingFace causal LM (default: gpt2)
+--steps                number of training steps (default: 100)
+--batch_size           per-GPU batch size (default: 4)
+--seq_len              sequence length (default: 512)
+--grad_accum           gradient accumulation steps (default: 1)
+--use_custom_allreduce replace NCCL all_reduce with custom ring all-reduce (DDP only)
 ```
 
 ---
@@ -149,5 +175,13 @@ The benchmarks were run on a real rented GPU (2× A100 SXM4 80GB on Vast.ai), no
 
 The goal was to actually understand and practice using a distributed training infrastructure.
 
-## Work in progress:
-I am trying to now build my own AllReduce and AllGather/ReduceScatter, and will try to compare it against the pytorch's torch.distributed
+## Ring AllReduce — implementation notes
+
+`ring_all_reduce.py` implements the classic two-phase algorithm from scratch using only `dist.send` and `dist.recv`:
+
+- **Reduce-scatter phase** (`world_size - 1` steps): each rank sends its current chunk to its right neighbour and accumulates the incoming chunk from its left. After the phase, each rank holds exactly one fully-summed chunk.
+- **AllGather phase** (`world_size - 1` steps): the finished chunks are relayed around the ring. Each rank overwrites (not accumulates) the incoming chunk — it's already a complete sum.
+- **Padding**: tensors whose element count isn't a multiple of `world_size` are zero-padded before splitting and trimmed after reconstruction. Zeros are identity elements for SUM, so they don't affect results.
+- **Deadlock avoidance**: even ranks send-then-recv; odd ranks recv-then-send. This breaks the simultaneous-send deadlock that would occur if every rank blocked on `send` before calling `recv`.
+
+The function is wired into `train.py` via `--use_custom_allreduce`. When the flag is set, DDP's built-in gradient sync is suppressed with `no_sync()` on every accumulation step, and `ring_all_reduce` is called manually on each parameter's `.grad` tensor after the backward pass, followed by a `div_(world_size)` to produce mean semantics — identical to what NCCL does internally.
