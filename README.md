@@ -1,191 +1,153 @@
 # llm-training-systems
 
-![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
-![PyTorch](https://img.shields.io/badge/PyTorch-2.4%2B-red)
-![License](https://img.shields.io/badge/License-MIT-green)
+A focused benchmark of distributed LLM training strategies using PyTorch — built to demonstrate production-level understanding of training infrastructure, parallelism, and numerical precision.
 
-A production-style LLM training harness showcasing **distributed training infrastructure** and **numerical precision engineering** — the systems side of LLM training that makes models scale.
-
-This repo does **not** demonstrate model architecture design. It demonstrates:
-
-| Capability | Implementation |
-|---|---|
-| Data parallelism | `DistributedDataParallel` (DDP) via torchrun |
-| ZeRO-3 style sharding | `FullyShardedDataParallel` (FSDP) with per-block wrapping |
-| BF16 / FP16 training | `torch.amp.autocast` + `GradScaler` |
-| FP8 training | `torchao.float8.convert_to_float8_training` |
-| Gradient accumulation | `no_sync()` to suppress redundant all-reduce/reduce-scatter |
-| Throughput profiling | tokens/sec, peak GPU memory per step |
+![Python](https://img.shields.io/badge/python-3.12-blue) ![PyTorch](https://img.shields.io/badge/PyTorch-2.12-orange) ![License](https://img.shields.io/badge/license-MIT-green)
 
 ---
 
-## Architecture: DDP vs FSDP Memory Layout
+## What this demonstrates
 
-```
-DDP (Data Parallelism)                  FSDP (ZeRO-3 Style)
-──────────────────────────────────      ──────────────────────────────────────────
-GPU 0: ┌──────────────────────────┐     GPU 0: ┌──────────────────────────────┐
-       │  Full Params   (100 %)   │            │  Param Shard     (100 % / N) │
-       │  Full Grads    (100 %)   │            │  Grad Shard      (100 % / N) │
-       │  Full Opt St.  (100 %)   │            │  Opt State Shard (100 % / N) │
-       └──────────────────────────┘            └──────────────────────────────┘
-GPU 1: identical copy ↑                 GPU 1: different shard ↑
-GPU 2: identical copy ↑                 GPU 2: different shard ↑
-GPU 3: identical copy ↑                 GPU 3: different shard ↑
-
-Memory per GPU: O(model_size)           Memory per GPU: O(model_size / N)
-
-Communication:                          Communication:
-  ▸ All-reduce gradients after bwd        ▸ All-gather params before fwd + bwd
-                                          ▸ Reduce-scatter grads after bwd
-```
-
-**Key insight:** DDP keeps a full model copy on every GPU — simple but memory-heavy. FSDP shards parameters, gradients, and optimizer state across GPUs, so a 70 B model that needs ~140 GB in BF16 becomes feasible across 8× H100 (17.5 GB/GPU) instead of requiring 8 identical 80 GB cards.
-
----
-
-## Why FP8 Matters
-
-Modern accelerators (H100, H200, Blackwell) include dedicated FP8 tensor cores. Compared to BF16:
-
-| Metric | BF16 | FP8 |
-|---|---|---|
-| Bits per weight | 16 | 8 |
-| Memory bandwidth | 1× | ~2× |
-| FLOPS (H100 SXM) | 989 TFLOPS | 1979 TFLOPS |
-| Numerical range | wide | narrow (needs scaling) |
-
-FP8 uses two formats: **E4M3** (higher precision, used for activations) and **E5M2** (wider range, used for gradients). Scaling factors prevent overflow/underflow — this is handled transparently by `torchao`'s `Float8Linear` which replaces `nn.Linear` at the module level.
-
-**When to use:** Any training run on Hopper-class (H100+) hardware where memory bandwidth is the bottleneck — which is almost all transformer training beyond a few hundred million parameters.
-
-```python
-# torchao replaces nn.Linear with Float8Linear in-place.
-# Weights/activations stored E4M3; gradients stored E5M2.
-# Accumulation happens in BF16 for stability.
-from torchao.float8 import convert_to_float8_training
-convert_to_float8_training(model)
-```
+- **DDP** (DistributedDataParallel) — data-parallel training with NCCL AllReduce gradient sync across GPUs
+- **FSDP** (FullyShardedDataParallel) — ZeRO-3 style sharding of model weights, gradients, and optimizer states across GPUs
+- **BF16 mixed precision** — automatic mixed precision via `torch.amp` for memory-efficient training
+- **Throughput & memory benchmarking** — tokens/sec, peak GPU memory, and loss tracked per run and saved to JSON
 
 ---
 
 ## Benchmark Results
 
-> **Note:** Fill in with real numbers after running on your hardware. Example below uses A100 80GB × 2.
+Ran on **2× NVIDIA A100 SXM4 80GB** (NVLink interconnect) on Vast.ai. Throughput compared at step 50 across all runs for apples-to-apples comparison.  
+Model: `gpt2` (~117M params) | Sequence length: 512 | Batch size: 4 | Steps: 50
 
-| Config | Tokens/sec | Peak Mem (GB) | Final Loss |
-|---|---|---|---|
-| ddp_fp32 | — | — | — |
-| ddp_bf16 | — | — | — |
-| ddp_fp16 | — | — | — |
-| ddp_fp8  | — | — | — |
-| fsdp_fp32 | — | — | — |
-| fsdp_bf16 | — | — | — |
-| fsdp_fp16 | — | — | — |
+| Strategy | Dtype | GPUs | Tokens/sec | Peak Mem/GPU | Final Loss |
+|----------|-------|------|-----------|--------------|------------|
+| DDP | BF16 | 1 | 19,092 | 5.39 GB | 3.56 |
+| DDP | BF16 | 2 | 32,474 | 5.39 GB | 3.34 |
+| FSDP | BF16 | 2 | 30,837 | 3.45 GB | 3.34 |
 
-Run `python benchmark.py` to populate this table and generate `results/benchmark_plot.png`.
+### Key takeaways
 
----
+**DDP 1→2 GPU: 1.70× speedup** — realistic scaling enabled by NVLink's 600 GB/s GPU-to-GPU bandwidth, which keeps NCCL AllReduce overhead minimal relative to compute.
 
-## Repo Structure
-
-```
-llm-training-systems/
-├── train.py          # Main training script (DDP/FSDP, all dtypes)
-├── benchmark.py      # Orchestrator: runs all combos, renders table + plot
-├── launch.sh         # torchrun wrapper with env-var overrides
-├── requirements.txt
-├── configs/
-│   ├── small.yaml    # gpt2, 512 seq_len, 2 GPUs
-│   └── medium.yaml   # gpt2-medium, 1024 seq_len, 4 GPUs, FSDP
-└── results/          # JSON per run + summary.csv + benchmark_plot.png
-```
+**FSDP vs DDP: 36% memory reduction at 7% throughput cost** — FSDP shards model parameters, gradients, and optimizer states across GPUs. Each GPU holds only `1/N` of the model at rest, reconstructing full layers on-demand via AllGather during forward/backward. At GPT-2 scale the memory saving is modest; at 70B+ scale it's what makes training possible on finite hardware.
 
 ---
 
-## Setup
+## Architecture
 
-```bash
-pip install -r requirements.txt
+### DDP — Data Parallel (each GPU holds full model)
+```
+┌─────────────────────────────────────────────┐
+│                  torchrun                    │
+│         (spawns 1 process per GPU)           │
+└──────────────┬──────────────────────────────┘
+               │
+    ┌──────────┴──────────┐
+    │                     │
+┌───▼────┐           ┌────▼───┐
+│ GPU 0  │           │ GPU 1  │
+│ Full   │           │ Full   │
+│ Model  │           │ Model  │
+│ Batch A│           │ Batch B│
+└───┬────┘           └────┬───┘
+    │    NCCL AllReduce   │
+    │  (average grads)    │
+    └─────────┬───────────┘
+              │
+     Identical weight update
 ```
 
-FP8 additionally requires CUDA 12.1+ and a Hopper-class GPU. The rest works on any CUDA-capable GPU.
+### FSDP — Fully Sharded (model split across GPUs)
+```
+┌─────────────────────────────────────────────┐
+│                  torchrun                    │
+└──────────────┬──────────────────────────────┘
+               │
+    ┌──────────┴──────────┐
+    │                     │
+┌───▼────┐           ┌────▼───┐
+│ GPU 0  │           │ GPU 1  │
+│ Shard 0│◄─AllGather─►Shard 1│  ← forward: reconstruct layer
+│ Grad 0 │◄─ReduceScatter──►  │  ← backward: scatter grad shards
+│ Opt  0 │           │ Opt  1 │  ← optimizer: each owns its shard
+└────────┘           └────────┘
+  2.5 GB               2.5 GB    (vs 5 GB each with DDP)
+```
+
+---
+
+## Why FSDP over DDP for large models
+
+DDP keeps a full model replica on every GPU. For a 70B parameter model in BF16, that's ~140 GB per GPU — impossible on an 80 GB A100. FSDP shards everything: with 8 GPUs you're down to ~17.5 GB per GPU for weights alone, before accounting for optimizer state sharding (which cuts another ~2–3× on top).
+
+The tradeoff is communication: FSDP does AllGather before every layer's forward and backward pass, then ReduceScatter to redistribute gradients. This is why you see a ~7% throughput penalty vs DDP at small scale — the extra comms add up. At large scale the math flips: DDP becomes impossible (OOM), and FSDP is the only viable option.
 
 ---
 
 ## Quickstart
 
-### Single GPU — DDP BF16 (simplest baseline)
+### Requirements
 ```bash
-torchrun --nproc_per_node=1 train.py --strategy ddp --dtype bf16 --steps 100
+pip install -r requirements.txt
 ```
 
-### Multi-GPU — DDP BF16
+### Single GPU (sanity check)
 ```bash
-torchrun --nproc_per_node=4 train.py --strategy ddp --dtype bf16 --steps 200
+torchrun --nproc_per_node=1 train.py --strategy ddp --dtype bf16 --steps 50
 ```
 
-### Multi-GPU — FSDP BF16 (ZeRO-3 style)
+### Multi-GPU DDP
 ```bash
-torchrun --nproc_per_node=4 train.py \
-    --strategy fsdp \
-    --dtype bf16 \
-    --model gpt2-medium \
-    --batch_size 4 \
-    --seq_len 1024 \
-    --grad_accum 4
+torchrun --nproc_per_node=2 train.py --strategy ddp --dtype bf16 --steps 100
 ```
 
-### FP8 on H100 (requires torchao + Hopper GPU)
+### Multi-GPU FSDP
 ```bash
-torchrun --nproc_per_node=1 train.py --strategy ddp --dtype fp8
+torchrun --nproc_per_node=2 train.py --strategy fsdp --dtype bf16 --steps 100
 ```
 
-### Load from config file
+### Run full benchmark
 ```bash
-NUM_GPUS=2 STRATEGY=fsdp DTYPE=bf16 ./launch.sh --config configs/medium.yaml
+python benchmark.py
+# outputs results/summary.csv and results/benchmark_plot.png
 ```
 
-### Run all benchmarks and generate comparison plots
-```bash
-python benchmark.py --gpus 2 --model gpt2 --steps 100
+### All flags
+```
+--strategy   ddp | fsdp
+--dtype      bf16 | fp16
+--model      any HuggingFace causal LM (default: gpt2)
+--steps      number of training steps (default: 100)
+--batch_size per-GPU batch size (default: 4)
+--seq_len    sequence length (default: 512)
+--grad_accum gradient accumulation steps (default: 1)
 ```
 
 ---
 
-## Key Training Flags
+## Stack
 
-| Flag | Default | Description |
-|---|---|---|
-| `--strategy` | `ddp` | `ddp` or `fsdp` |
-| `--dtype` | `bf16` | `fp32`, `bf16`, `fp16`, `fp8` |
-| `--model` | `gpt2` | Any HuggingFace causal LM |
-| `--batch_size` | `4` | Per-GPU micro-batch size |
-| `--seq_len` | `512` | Sequence length in tokens |
-| `--steps` | `100` | Optimizer steps |
-| `--grad_accum` | `1` | Gradient accumulation steps |
-| `--config` | — | YAML config to load |
-
-Effective global batch size = `batch_size × grad_accum × world_size × seq_len` tokens.
+- **PyTorch 2.12** — DDP, FSDP, AMP
+- **NCCL** — GPU-to-GPU collective communications (AllReduce, AllGather, ReduceScatter)
+- **HuggingFace Transformers** — model loading
+- **HuggingFace Datasets** — streaming wikitext-103
+- **torchao** — quantization utilities
+- **torchrun** — multi-process launcher
 
 ---
 
-## Gradient Accumulation and `no_sync()`
+## Notes on FP8
 
-When `--grad_accum > 1`, the inner loop calls `model.no_sync()` on all but the last micro-step:
+FP8 training via `torchao` requires compute capability ≥ 8.9 (RTX 4090) or ≥ 9.0 (H100). The A100 is compute capability 8.0 and does not support `torch._scaled_mm` natively. FP8 emulation mode is possible but doesn't reflect real hardware performance — so BF16 benchmarks are reported here as the honest baseline.
 
-```
-micro-step 0:  forward + backward  ─── no_sync() ──→ gradients stay local
-micro-step 1:  forward + backward  ─── no_sync() ──→ gradients stay local
-micro-step 2:  forward + backward  ─── sync ──────→ all-reduce (DDP) or
-                                                     reduce-scatter (FSDP)
-optimizer.step()
-```
+## A note on process
 
-Without `no_sync()`, DDP triggers an all-reduce after every `.backward()` call, multiplying communication by `grad_accum` — a significant overhead on slow interconnects.
+This project was built with the assistance of AI at various stages — code generation (some parts), debugging, and architecture decisions. However, every piece of generated code was read, understood, and validated before being used. Nothing was blindly copy-pasted.
 
----
+The benchmarks were run on a real rented GPU (2× A100 SXM4 80GB on Vast.ai), not simulated or fabricated. The numbers were then cross-checked for correctness — for example, an initially reported 2.48× scaling figure was identified as a measurement artifact (different step counts between runs) and corrected to the honest 1.70× step-matched comparison.
 
-## License
+The goal was to actually understand and practice using a distributed training infrastructure.
 
-MIT
+## Work in progress:
+I am trying to now build my own AllReduce and AllGather/ReduceScatter, and will try to compare it against the pytorch's torch.distributed
