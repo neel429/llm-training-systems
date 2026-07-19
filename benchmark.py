@@ -59,6 +59,8 @@ def parse_args() -> argparse.Namespace:
                    help="Skip training runs; only visualise existing result JSONs")
     p.add_argument("--force-rerun",    action="store_true",
                    help="Re-run even if a result JSON already exists")
+    p.add_argument("--bench-custom-allreduce", action="store_true",
+                   help="Also run DDP combos with the custom ring all-reduce for comparison")
     return p.parse_args()
 
 
@@ -70,6 +72,7 @@ def run_combo(
     strategy: str,
     dtype: str,
     args: argparse.Namespace,
+    custom_allreduce: bool = False,
 ) -> bool:
     """
     Launch one train.py run via torch.distributed.run (torchrun).
@@ -78,13 +81,16 @@ def run_combo(
     We use `python -m torch.distributed.run` instead of the `torchrun` shell
     wrapper so this works cross-platform without adding torchrun to PATH.
     """
-    out_path = Path(args.output_dir) / f"{strategy}_{dtype}.json"
+    suffix   = "_ring" if custom_allreduce else ""
+    key      = f"{strategy}_{dtype}{suffix}"
+    out_path = Path(args.output_dir) / f"{key}.json"
     if out_path.exists() and not args.force_rerun:
-        print(f"  [skip] {strategy}_{dtype} — result already exists")
+        print(f"  [skip] {key} — result already exists")
         return True
 
     print(f"\n{'─'*50}")
-    print(f"  Running: strategy={strategy}  dtype={dtype}")
+    print(f"  Running: strategy={strategy}  dtype={dtype}"
+          + ("  allreduce=ring" if custom_allreduce else ""))
     print(f"{'─'*50}")
 
     cmd = [
@@ -101,10 +107,12 @@ def run_combo(
         "--grad_accum",  str(args.grad_accum),
         "--output_dir",  args.output_dir,
     ]
+    if custom_allreduce:
+        cmd.append("--use_custom_allreduce")
 
     result = subprocess.run(cmd)
     if result.returncode != 0:
-        print(f"  [FAILED] {strategy}_{dtype} exited with code {result.returncode}")
+        print(f"  [FAILED] {key} exited with code {result.returncode}")
         return False
     return True
 
@@ -113,14 +121,23 @@ def run_combo(
 # Results loading
 # ---------------------------------------------------------------------------
 
-def load_results(output_dir: str, combos: list[tuple[str, str]]) -> list[dict]:
+def load_results(
+    output_dir: str,
+    combos: list[tuple[str, str]],
+    custom_allreduce: bool = False,
+) -> list[dict]:
     results = []
     for strategy, dtype in combos:
-        path = Path(output_dir) / f"{strategy}_{dtype}.json"
+        suffix = "_ring" if custom_allreduce else ""
+        key    = f"{strategy}_{dtype}{suffix}"
+        path   = Path(output_dir) / f"{key}.json"
         if path.exists():
-            results.append(json.loads(path.read_text()))
+            data = json.loads(path.read_text())
+            if custom_allreduce:
+                data["_label"] = key   # carry the ring label into the plot
+            results.append(data)
         else:
-            print(f"  [missing] No result for {strategy}_{dtype}")
+            print(f"  [missing] No result for {key}")
     return results
 
 
@@ -168,7 +185,7 @@ def save_plot(results: list[dict], output_dir: str) -> None:
     if not results:
         return
 
-    configs     = [f"{r['strategy']}\n{r['dtype']}" for r in results]
+    configs     = [r.get("_label", f"{r['strategy']}\n{r['dtype']}") for r in results]
     tok_per_sec = [r["tokens_per_sec"]               for r in results]
     peak_mem    = [r["peak_mem_gb"]                  for r in results]
     x           = range(len(configs))
@@ -205,6 +222,9 @@ def main() -> None:
     args   = parse_args()
     combos = _BASE_COMBOS + (_FP8_COMBOS if args.include_fp8 else [])
 
+    # Only DDP combos are eligible for the custom ring all-reduce
+    ddp_combos = [(s, d) for s, d in combos if s == "ddp"]
+
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
     if not args.skip_training:
@@ -212,7 +232,14 @@ def main() -> None:
         for strategy, dtype in combos:
             run_combo(strategy, dtype, args)
 
+        if args.bench_custom_allreduce:
+            print(f"\nBenchmarking {len(ddp_combos)} config(s) with custom ring all-reduce...")
+            for strategy, dtype in ddp_combos:
+                run_combo(strategy, dtype, args, custom_allreduce=True)
+
     results = load_results(args.output_dir, combos)
+    if args.bench_custom_allreduce:
+        results += load_results(args.output_dir, ddp_combos, custom_allreduce=True)
 
     if not results:
         print("\nNo results found. Run without --skip-training first.")
