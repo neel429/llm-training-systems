@@ -62,7 +62,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grad_accum",  type=int, default=1,
                    help="Gradient accumulation steps. Effective BS = batch_size × grad_accum × world_size")
     p.add_argument("--lr",          type=float, default=3e-4)
+    p.add_argument("--warmup_steps", type=int,  default=0,
+                   help="Linear LR warmup steps from 0 → lr")
     p.add_argument("--output_dir",  default="results")
+    p.add_argument("--seed",        type=int,  default=42,
+                   help="Base RNG seed; each rank gets seed+rank for data diversity")
     p.add_argument("--use_custom_allreduce", action="store_true",
                    help="Replace DDP's built-in all-reduce with the custom ring all-reduce (DDP only)")
     return p.parse_args()
@@ -268,11 +272,20 @@ def train(args: argparse.Namespace) -> None:
             f"{'='*60}"
         )
 
+    torch.manual_seed(args.seed + rank)
+    torch.cuda.manual_seed_all(args.seed + rank)
+
     stream = TokenStream(args.model, args.seq_len, rank, world_size)
     model  = build_model(args)
     model  = wrap_model(model, args, local_rank)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    warmup_scheduler = (
+        torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1e-8, end_factor=1.0, total_iters=args.warmup_steps
+        )
+        if args.warmup_steps > 0 else None
+    )
 
     # GradScaler is only needed for FP16 + DDP. BF16 doesn't overflow in the
     # same way FP16 does, and FSDP FP16 uses its own ShardedGradScaler internally.
@@ -338,15 +351,18 @@ def train(args: argparse.Namespace) -> None:
         if scaler is not None:
             if not already_unscaled:
                 scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
         elif isinstance(model, FSDP):
-            model.clip_grad_norm_(1.0)
+            grad_norm = model.clip_grad_norm_(1.0)
             optimizer.step()
         else:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+
+        if warmup_scheduler is not None:
+            warmup_scheduler.step()
 
         # Tokens processed across ALL ranks this step
         tokens_this_step = args.batch_size * args.seq_len * args.grad_accum * world_size
@@ -360,6 +376,7 @@ def train(args: argparse.Namespace) -> None:
             print(
                 f"  step {step:4d}/{args.steps}"
                 f"  loss={step_loss * args.grad_accum:.4f}"
+                f"  grad_norm={grad_norm:.3f}"
                 f"  tok/s={tok_per_sec:,.0f}"
                 f"  peak_mem={peak_gb:.2f} GB"
             )
